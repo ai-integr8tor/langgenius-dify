@@ -1,9 +1,10 @@
 import logging
+from datetime import datetime
 from typing import Literal
 
 from flask import request
 from flask_restx import Resource
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from werkzeug.exceptions import Forbidden, InternalServerError, NotFound
 
@@ -54,12 +55,11 @@ from core.errors.error import (
 from extensions.ext_database import db
 from extensions.ext_redis import redis_client
 from fields.base import ResponseModel
-from fields.dataset_fields import DatasetDetailResponse
 from fields.message_fields import SuggestedQuestionsResponse
 from graphon.graph_engine.manager import GraphEngineManager
 from graphon.model_runtime.errors.invoke import InvokeError
 from libs import helper
-from libs.helper import dump_response, uuid_value
+from libs.helper import dump_response, to_timestamp, uuid_value
 from models import Account
 from models.account import TenantStatus
 from models.model import AppMode, Site
@@ -86,8 +86,21 @@ from services.recommended_app_service import RecommendedAppService
 logger = logging.getLogger(__name__)
 
 
-class TrialDatasetListItemResponse(DatasetDetailResponse):
-    pass
+class TrialDatasetListItemResponse(ResponseModel):
+    id: str
+    name: str
+    description: str | None
+    permission: str
+    data_source_type: str | None
+    indexing_technique: str | None
+    created_by: str
+    created_at: int | None
+    permission_keys: list[str] = Field(default_factory=list)
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _normalize_timestamp(cls, value: datetime | int | None) -> int | None:
+        return to_timestamp(value)
 
 
 class TrialDatasetListResponse(ResponseModel):
