@@ -553,6 +553,9 @@ class AppWorkflowApi(Resource):
             raise AppUnavailableError()
 
         workflow = db.session.get(Workflow, app_model.workflow_id)
+        if workflow is None:
+            raise AppUnavailableError()
+
         return dump_response(WorkflowResponse, workflow)
 
 
