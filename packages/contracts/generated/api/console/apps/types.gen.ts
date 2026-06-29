@@ -733,7 +733,7 @@ export type WorkflowRunPaginationResponse = {
 
 export type WorkflowRunDetailResponse = {
   created_at?: number | null
-  created_by_account?: SimpleAccount | null
+  created_by_account?: SimpleAccountResponse | null
   created_by_end_user?: SimpleEndUser | null
   created_by_role?: string | null
   elapsed_time?: number | null
@@ -801,7 +801,7 @@ export type WorkflowCommentCreate = {
 }
 
 export type WorkflowCommentMentionUsersPayload = {
-  users: Array<AccountWithRole>
+  users: Array<AccountWithRoleResponse>
 }
 
 export type WorkflowCommentDetail = {
@@ -889,7 +889,7 @@ export type DefaultBlockConfigResponse = {
 export type WorkflowResponse = {
   conversation_variables: Array<WorkflowConversationVariableResponse>
   created_at: number
-  created_by?: SimpleAccount | null
+  created_by?: SimpleAccountResponse | null
   environment_variables: Array<WorkflowEnvironmentVariableResponse>
   features: {
     [key: string]: unknown
@@ -904,7 +904,7 @@ export type WorkflowResponse = {
   rag_pipeline_variables: Array<PipelineVariableResponse>
   tool_published: boolean
   updated_at: number
-  updated_by?: SimpleAccount | null
+  updated_by?: SimpleAccountResponse | null
   version: string
 }
 
@@ -1034,7 +1034,7 @@ export type AgentComposerValidateResponse = {
 
 export type WorkflowRunNodeExecutionResponse = {
   created_at?: number | null
-  created_by_account?: SimpleAccount | null
+  created_by_account?: SimpleAccountResponse | null
   created_by_end_user?: SimpleEndUser | null
   created_by_role?: string | null
   elapsed_time?: number | null
@@ -1305,7 +1305,7 @@ export type WorkflowOnlineUsersByApp = {
 export type AdvancedChatWorkflowRunForListResponse = {
   conversation_id?: string | null
   created_at?: number | null
-  created_by_account?: SimpleAccount | null
+  created_by_account?: SimpleAccountResponse | null
   elapsed_time?: number | null
   exceptions_count?: number | null
   finished_at?: number | null
@@ -1611,7 +1611,7 @@ export type UserSatisfactionRateStatisticItem = {
 
 export type WorkflowAppLogPartialResponse = {
   created_at?: number | null
-  created_by_account?: SimpleAccount | null
+  created_by_account?: SimpleAccountResponse | null
   created_by_end_user?: SimpleEndUser | null
   created_by_role?: string | null
   created_from?: string | null
@@ -1622,7 +1622,7 @@ export type WorkflowAppLogPartialResponse = {
 
 export type WorkflowArchivedLogPartialResponse = {
   created_at?: number | null
-  created_by_account?: SimpleAccount | null
+  created_by_account?: SimpleAccountResponse | null
   created_by_end_user?: SimpleEndUser | null
   id: string
   trigger_metadata?: unknown
@@ -1631,7 +1631,7 @@ export type WorkflowArchivedLogPartialResponse = {
 
 export type WorkflowRunForListResponse = {
   created_at?: number | null
-  created_by_account?: SimpleAccount | null
+  created_by_account?: SimpleAccountResponse | null
   elapsed_time?: number | null
   exceptions_count?: number | null
   finished_at?: number | null
@@ -1643,7 +1643,7 @@ export type WorkflowRunForListResponse = {
   version?: string | null
 }
 
-export type SimpleAccount = {
+export type SimpleAccountResponse = {
   email: string
   id: string
   name: string
@@ -1686,8 +1686,9 @@ export type WorkflowCommentBasic = {
   updated_at?: number | null
 }
 
-export type AccountWithRole = {
+export type AccountWithRoleResponse = {
   avatar?: string | null
+  readonly avatar_url: string | null
   created_at?: number | null
   email: string
   id: string
@@ -2008,7 +2009,14 @@ export type ModelConfigPartial = {
 
 export type LlmMode = 'chat' | 'completion'
 
-export type Type = 'github' | 'marketplace' | 'package'
+export type Type
+  = | 'app-selector'
+    | 'array[tools]'
+    | 'boolean'
+    | 'model-selector'
+    | 'secret-input'
+    | 'select'
+    | 'text-input'
 
 export type Github = {
   github_plugin_unique_identifier: string
@@ -2076,6 +2084,12 @@ export type SimpleMessageDetail = {
   }
   message: string
   query: string
+}
+
+export type SimpleAccount = {
+  email: string
+  id: string
+  name: string
 }
 
 export type HumanInputFormDefinition = {
@@ -2772,6 +2786,10 @@ export type WorkflowCommentBasicListWritable = {
   data: Array<WorkflowCommentBasicWritable>
 }
 
+export type WorkflowCommentMentionUsersPayloadWritable = {
+  users: Array<AccountWithRoleResponseWritable>
+}
+
 export type WorkflowCommentDetailWritable = {
   content: string
   created_at?: number | null
@@ -2860,6 +2878,21 @@ export type WorkflowCommentBasicWritable = {
   resolved_by?: string | null
   resolved_by_account?: WorkflowCommentAccountWritable | null
   updated_at?: number | null
+}
+
+export type AccountWithRoleResponseWritable = {
+  avatar?: string | null
+  created_at?: number | null
+  email: string
+  id: string
+  last_active_at?: number | null
+  last_login_at?: number | null
+  name: string
+  role: string
+  roles?: Array<{
+    [key: string]: string
+  }>
+  status: string
 }
 
 export type WorkflowCommentAccountWritable = {
