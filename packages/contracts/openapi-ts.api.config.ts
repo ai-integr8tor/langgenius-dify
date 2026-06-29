@@ -39,7 +39,6 @@ type ApiSpec = {
 }
 
 type ApiJob = {
-  clean?: boolean
   document: SwaggerDocument
   outputPath: string
   plugins?: UserConfig['plugins']
@@ -367,20 +366,12 @@ const writeConsoleContractEntry = (segments: string[]) => {
   fs.writeFileSync(entryPath, consoleContractEntryContent(segments))
 }
 
-const createConsoleContractEntryJob = (document: SwaggerDocument, segments: string[]): ApiJob => {
-  return {
-    clean: false,
-    document,
-    outputPath: 'generated/api/console',
-    plugins: [],
-    source: {
-      callback: () => writeConsoleContractEntry(segments),
-      enabled: true,
-      path: null,
-      serialize: () => '',
-    },
-  }
-}
+const consoleContractEntrySource = (segments: string[]): NonNullable<ApiJob['source']> => ({
+  callback: () => writeConsoleContractEntry(segments),
+  enabled: true,
+  path: null,
+  serialize: () => '',
+})
 
 const splitConsoleDocument = (document: SwaggerDocument) => {
   const pathsBySegment = new Map<string, Record<string, Record<string, unknown>>>()
@@ -393,12 +384,13 @@ const splitConsoleDocument = (document: SwaggerDocument) => {
   }
 
   const segments = [...pathsBySegment.keys()].sort((left, right) => left.localeCompare(right))
-  const jobs = segments.map((segment): ApiJob => ({
+  const jobs = segments.map((segment, index): ApiJob => ({
     document: cloneDocumentWithPaths(document, pathsBySegment.get(segment) ?? {}),
     outputPath: `generated/api/console/${toKebabCase(segment)}`,
+    ...(index === 0 ? { source: consoleContractEntrySource(segments) } : {}),
   }))
 
-  return [...jobs, createConsoleContractEntryJob(document, segments)]
+  return jobs
 }
 
 const createApiJobs = (spec: ApiSpec): ApiJob[] => {
@@ -423,7 +415,6 @@ const createApiConfig = (job: ApiJob): UserConfig => ({
     file: false,
   },
   output: {
-    ...(job.clean === undefined ? {} : { clean: job.clean }),
     entryFile: false,
     fileName: {
       suffix: '.gen',
