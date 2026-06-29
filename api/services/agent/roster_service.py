@@ -24,7 +24,7 @@ from models.agent import (
 )
 from models.agent_config_entities import AgentSoulConfig
 from models.enums import AppStatus, ConversationFromSource, ConversationStatus
-from models.model import App, AppMode, AppModelConfig, Conversation, IconType
+from models.model import App, AppMode, AppModelConfig, Conversation, IconType, Message
 from models.workflow import Workflow
 from services.agent.agent_soul_state import agent_soul_has_model
 from services.agent.composer_validator import ComposerConfigValidator
@@ -571,6 +571,18 @@ class AgentRosterService:
             self._session.commit()
         return conversation_id
 
+    def count_agent_app_debug_conversation_messages(self, *, conversation_id: str) -> int:
+        """Return the number of visible messages in an Agent App debug conversation."""
+
+        return (
+            self._session.scalar(
+                select(func.count(Message.id)).where(
+                    Message.conversation_id == conversation_id,
+                )
+            )
+            or 0
+        )
+
     def refresh_agent_app_debug_conversation_id(
         self, *, tenant_id: str, agent_id: str, account_id: str, commit: bool = True
     ) -> str:
@@ -992,9 +1004,10 @@ class AgentRosterService:
     def load_active_config_is_published_by_agent_id(self, *, tenant_id: str, agents: list[Agent]) -> dict[str, bool]:
         """Return each Agent's stored normal-draft publish state.
 
-        The flag is maintained by write paths: normal shared draft writes mark it
-        dirty, while publish/version creation paths mark it clean. User-scoped
-        debug drafts intentionally do not affect this state.
+        The flag is maintained by write paths against the normal shared draft:
+        saves compare the draft content with the active snapshot, while publish
+        and version creation paths mark the new active snapshot clean.
+        User-scoped debug drafts intentionally do not affect this state.
         """
         agents = [agent for agent in agents if agent.id]
         if not agents:

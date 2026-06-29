@@ -106,6 +106,32 @@ class ChatMessagePayload(BaseMessagePayload):
         return uuid_value(value)
 
 
+_BUILD_CHAT_FINALIZATION_QUERY = """Finalize this Build chat configuration for the agent.
+
+Inspect the current build-draft config and shell state, then summarize the changes made during this Build chat.
+
+You must update the build-draft config as needed:
+
+- Update config files for reusable artifacts that should be available later.
+- Update config skills for reusable procedures or tools that should be available later.
+- Update config env when environment keys or values need to be recorded.
+- Update the config note with useful new build context when available. This is strongly recommended even if no files,
+  skills, or env changed, because each Build chat usually discovers information worth preserving.
+
+When you update the config note, it should clearly state:
+
+- what you installed or configured outside the workspace for this agent,
+- where those external updates live, including CLI tools, packages, and persistent $HOME paths,
+- how the agent should use it in later runs,
+- any setup, authentication, or user action still required.
+
+Do not repeat details already managed through `dify-agent config push` for config files, skills, or env.
+Persist the build-draft config by piping the JSON push spec to `dify-agent config push`.
+Local file edits alone are not saved as config. If you updated only the note, still push the updated note.
+
+After the push completes, respond FINISHED."""
+
+
 register_schema_models(console_ns, CompletionMessagePayload, ChatMessagePayload)
 register_response_schema_models(console_ns, GeneratedAppResponse, SimpleResultResponse)
 
@@ -231,6 +257,31 @@ class AgentChatMessageApi(Resource):
         )
 
 
+@console_ns.route("/agent/<uuid:agent_id>/build-chat/finalize")
+class AgentBuildChatFinalizeApi(Resource):
+    @console_ns.doc("finalize_agent_build_chat")
+    @console_ns.doc(description="Run a build-draft Agent App turn that asks the agent to push config updates")
+    @console_ns.doc(params={"agent_id": "Agent ID"})
+    @console_ns.response(200, "Build chat finalization started", console_ns.models[GeneratedAppResponse.__name__])
+    @console_ns.response(400, "Invalid request parameters")
+    @console_ns.response(404, "Agent, build draft, or conversation not found")
+    @setup_required
+    @login_required
+    @account_initialization_required
+    @edit_permission_required
+    @rbac_permission_required(RBACResourceScope.APP, RBACPermission.APP_TEST_AND_RUN)
+    @with_current_user
+    @with_current_tenant_id
+    def post(self, current_tenant_id: str, current_user: Account, agent_id: UUID):
+        app_model = resolve_agent_runtime_app_model(tenant_id=current_tenant_id, agent_id=agent_id)
+        return _create_build_chat_finalization_message(
+            current_tenant_id=current_tenant_id,
+            current_user=current_user,
+            app_model=app_model,
+            agent_id=str(agent_id),
+        )
+
+
 @console_ns.route("/apps/<uuid:app_id>/chat-messages/<string:task_id>/stop")
 class ChatMessageStopApi(Resource):
     @console_ns.doc("stop_chat_message")
@@ -284,7 +335,11 @@ def _resolve_current_user_agent_debug_conversation_id(
 
 
 def _create_chat_message(
-    *, current_user: Account, app_model: App, current_tenant_id: str | None = None, agent_id: str | None = None
+    *,
+    current_user: Account,
+    app_model: App,
+    current_tenant_id: str | None = None,
+    agent_id: str | None = None,
 ):
     raw_payload = console_ns.payload or {}
     args_model = ChatMessagePayload.model_validate(raw_payload)
@@ -314,6 +369,50 @@ def _create_chat_message(
     if external_trace_id:
         args["external_trace_id"] = external_trace_id
 
+    return _generate_chat_message_response(
+        current_user=current_user,
+        app_model=app_model,
+        args=args,
+        streaming=streaming,
+    )
+
+
+def _create_build_chat_finalization_message(
+    *, current_user: Account, app_model: App, current_tenant_id: str, agent_id: str
+):
+    debug_conversation_id = _resolve_current_user_agent_debug_conversation_id(
+        current_tenant_id=current_tenant_id,
+        current_user=current_user,
+        app_model=app_model,
+        agent_id=agent_id,
+    )
+    args: dict[str, Any] = {
+        "query": _BUILD_CHAT_FINALIZATION_QUERY,
+        "inputs": {},
+        "response_mode": "streaming",
+        "draft_type": "debug_build",
+        "conversation_id": debug_conversation_id,
+        "auto_generate_name": False,
+    }
+    external_trace_id = get_external_trace_id(request)
+    if external_trace_id:
+        args["external_trace_id"] = external_trace_id
+
+    return _generate_chat_message_response(
+        current_user=current_user,
+        app_model=app_model,
+        args=args,
+        streaming=True,
+    )
+
+
+def _generate_chat_message_response(
+    *,
+    current_user: Account,
+    app_model: App,
+    args: dict[str, Any],
+    streaming: bool,
+):
     try:
         response = AppGenerateService.generate(
             app_model=app_model, user=current_user, args=args, invoke_from=InvokeFrom.DEBUGGER, streaming=streaming
