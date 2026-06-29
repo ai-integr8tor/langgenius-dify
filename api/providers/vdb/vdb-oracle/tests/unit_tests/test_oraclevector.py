@@ -62,9 +62,9 @@ def oracle_module(monkeypatch: pytest.MonkeyPatch):
 
 def _config(module, **overrides):
     values = {
-        "user": "system",
-        "password": "oracle",
-        "dsn": "oracle:1521/freepdb1",
+        "user": "test_user",
+        "password": "test_password",
+        "dsn": "test-db.example:1521/testpdb",
         "is_autonomous": False,
     }
     values.update(overrides)
@@ -87,6 +87,32 @@ def test_oracle_config_validation_required_fields(oracle_module, field, value, m
         oracle_module.OracleVectorConfig.model_validate(values)
 
 
+def test_oracle_config_validation_missing_required_field(oracle_module):
+    values = _config(oracle_module).model_dump()
+    values.pop("user")
+
+    with pytest.raises(ValidationError, match="config ORACLE_USER is required"):
+        oracle_module.OracleVectorConfig.model_validate(values)
+
+
+def test_oracle_config_validation_pool_settings(oracle_module):
+    config = _config(oracle_module)
+
+    assert config.pool_min == 1
+    assert config.pool_max == 5
+    assert config.pool_increment == 1
+    assert config.pool_ping_interval == 0
+
+    with pytest.raises(ValidationError, match="pool_min must be less than or equal to pool_max"):
+        _config(oracle_module, pool_min=6, pool_max=5)
+
+    with pytest.raises(ValidationError, match="pool_increment must be greater than 0"):
+        _config(oracle_module, pool_increment=0)
+
+    with pytest.raises(ValidationError, match="pool_ping_interval must be greater than or equal to 0"):
+        _config(oracle_module, pool_ping_interval=-1)
+
+
 def test_oracle_config_validation_autonomous_requirements(oracle_module):
     with pytest.raises(ValidationError, match="config_dir is required"):
         oracle_module.OracleVectorConfig.model_validate(
@@ -102,6 +128,61 @@ def test_init_and_get_type(oracle_module, monkeypatch: pytest.MonkeyPatch):
     assert vector.get_type() == "oracle"
     assert vector.table_name == "embedding_collection_1"
     assert vector.pool is pool
+
+
+def test_init_reuses_pool_for_matching_config(oracle_module, monkeypatch: pytest.MonkeyPatch):
+    pool = MagicMock()
+    create_pool = MagicMock(return_value=pool)
+    monkeypatch.setattr(oracle_module.oracledb, "create_pool", create_pool)
+
+    first = oracle_module.OracleVector("collection_1", _config(oracle_module))
+    second = oracle_module.OracleVector("collection_2", _config(oracle_module))
+
+    assert first.pool is pool
+    assert second.pool is pool
+    create_pool.assert_called_once_with(
+        user="test_user",
+        password="test_password",
+        dsn="test-db.example:1521/testpdb",
+        min=1,
+        max=5,
+        increment=1,
+        ping_interval=0,
+    )
+
+
+def test_init_uses_different_pools_for_different_configs(oracle_module, monkeypatch: pytest.MonkeyPatch):
+    first_pool = MagicMock()
+    second_pool = MagicMock()
+    create_pool = MagicMock(side_effect=[first_pool, second_pool])
+    monkeypatch.setattr(oracle_module.oracledb, "create_pool", create_pool)
+
+    first = oracle_module.OracleVector("collection_1", _config(oracle_module))
+    second = oracle_module.OracleVector("collection_2", _config(oracle_module, dsn="other:1521/pdb"))
+
+    assert first.pool is first_pool
+    assert second.pool is second_pool
+    assert create_pool.call_count == 2
+
+
+def test_init_rejects_unsafe_collection_names(oracle_module, monkeypatch: pytest.MonkeyPatch):
+    create_pool = MagicMock()
+    monkeypatch.setattr(oracle_module.oracledb, "create_pool", create_pool)
+
+    with pytest.raises(ValueError, match="Invalid Oracle identifier"):
+        oracle_module.OracleVector("collection-1", _config(oracle_module))
+
+    create_pool.assert_not_called()
+
+
+def test_init_rejects_generated_text_index_names_that_are_too_long(oracle_module, monkeypatch: pytest.MonkeyPatch):
+    create_pool = MagicMock()
+    monkeypatch.setattr(oracle_module.oracledb, "create_pool", create_pool)
+
+    with pytest.raises(ValueError, match="text_index_name"):
+        oracle_module.OracleVector("c" * 111, _config(oracle_module))
+
+    create_pool.assert_not_called()
 
 
 def test_numpy_converters_and_type_handlers(oracle_module):
@@ -139,25 +220,113 @@ def test_numpy_converters_and_type_handlers(oracle_module):
     assert out_float64.dtype == numpy.float64
 
 
-def test_get_connection_supports_standard_and_autonomous_paths(oracle_module, monkeypatch: pytest.MonkeyPatch):
-    connect = MagicMock(return_value="connection")
-    monkeypatch.setattr(oracle_module.oracledb, "connect", connect)
+def test_get_connection_acquires_from_pool_and_releases_it(oracle_module):
+    pool = MagicMock()
+    connection = MagicMock()
+    pool.acquire.return_value = connection
 
     vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
-    vector.config = _config(oracle_module)
-    assert vector._get_connection() == "connection"
-    connect.assert_called_with(user="system", password="oracle", dsn="oracle:1521/freepdb1")
+    vector.pool = pool
 
-    vector.config = _config(
+    with vector._get_connection() as conn:
+        assert conn is connection
+
+    pool.acquire.assert_called_once_with()
+    pool.release.assert_called_once_with(connection)
+
+
+def test_get_connection_releases_pool_after_errors(oracle_module):
+    pool = MagicMock()
+    connection = MagicMock()
+    pool.acquire.return_value = connection
+
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.pool = pool
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with vector._get_connection():
+            raise RuntimeError("boom")
+
+    connection.rollback.assert_called_once_with()
+    pool.release.assert_called_once_with(connection)
+
+
+def test_get_connection_drops_closed_connections(oracle_module):
+    pool = MagicMock()
+    connection = MagicMock()
+    pool.acquire.return_value = connection
+
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.pool = pool
+
+    with pytest.raises(RuntimeError, match="DPY-4011"):
+        with vector._get_connection():
+            raise RuntimeError("DPY-4011: the database or network closed the connection")
+
+    connection.rollback.assert_not_called()
+    pool.drop.assert_called_once_with(connection)
+    pool.release.assert_not_called()
+
+
+def test_get_connection_drops_connection_when_release_reports_it_closed(oracle_module):
+    pool = MagicMock()
+    connection = MagicMock()
+    pool.acquire.return_value = connection
+    pool.release.side_effect = RuntimeError("DPY-4011: the database or network closed the connection")
+
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.pool = pool
+
+    with vector._get_connection() as conn:
+        assert conn is connection
+
+    pool.release.assert_called_once_with(connection)
+    pool.drop.assert_called_once_with(connection)
+
+
+def test_get_connection_releases_pool_when_rollback_fails(oracle_module):
+    pool = MagicMock()
+    connection = MagicMock()
+    connection.rollback.side_effect = RuntimeError("rollback failed")
+    pool.acquire.return_value = connection
+
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.pool = pool
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with vector._get_connection():
+            raise RuntimeError("boom")
+
+    connection.rollback.assert_called_once_with()
+    pool.release.assert_called_once_with(connection)
+
+
+def test_create_connection_pool_supports_standard_and_autonomous_paths(oracle_module, monkeypatch: pytest.MonkeyPatch):
+    create_pool = MagicMock(return_value="pool")
+    monkeypatch.setattr(oracle_module.oracledb, "create_pool", create_pool)
+
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    assert vector._create_connection_pool(_config(oracle_module, pool_min=2, pool_max=8, pool_increment=2)) == "pool"
+    create_pool.assert_called_with(
+        user="test_user",
+        password="test_password",
+        dsn="test-db.example:1521/testpdb",
+        min=2,
+        max=8,
+        increment=2,
+        ping_interval=0,
+    )
+
+    config = _config(
         oracle_module,
         is_autonomous=True,
         config_dir="/wallet",
         wallet_location="/wallet",
         wallet_password="pw",
     )
-    vector._get_connection()
-    assert connect.call_args.kwargs["config_dir"] == "/wallet"
-    assert connect.call_args.kwargs["wallet_location"] == "/wallet"
+    vector._create_connection_pool(config)
+    assert create_pool.call_args.kwargs["config_dir"] == "/wallet"
+    assert create_pool.call_args.kwargs["wallet_location"] == "/wallet"
 
 
 def test_create_delegates_collection_and_insert(oracle_module):
@@ -173,6 +342,109 @@ def test_create_delegates_collection_and_insert(oracle_module):
     vector.add_texts.assert_called_once_with(docs, [[0.1, 0.2]])
 
 
+def test_create_validates_embedding_shape(oracle_module):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector._create_collection = MagicMock()
+    vector.add_texts = MagicMock()
+    docs = [
+        Document(page_content="doc-1", metadata={"doc_id": "seg-1"}),
+        Document(page_content="doc-2", metadata={"doc_id": "seg-2"}),
+    ]
+
+    assert vector.create([], []) == []
+
+    with pytest.raises(ValueError, match="same length"):
+        vector.create(docs, [[0.1]])
+
+    with pytest.raises(ValueError, match="same dimension"):
+        vector.create(docs, [[0.1], [0.1, 0.2]])
+
+    with pytest.raises(ValueError, match="at least one dimension"):
+        vector.create([docs[0]], [[]])
+
+
+@pytest.mark.parametrize("bad_top_k", [0, -1, True, "bad", "1.5", 10001])
+def test_validate_top_k_rejects_invalid_values(oracle_module, bad_top_k):
+    with pytest.raises(ValueError, match="top_k"):
+        oracle_module.validate_top_k(bad_top_k, 4)
+
+
+def test_validate_top_k_uses_default_only_when_missing(oracle_module):
+    assert oracle_module.validate_top_k(None, 4) == 4
+    assert oracle_module.validate_top_k("8", 4) == 8
+
+
+def test_oracle_text_query_keeps_split_safe_tokens(oracle_module):
+    assert oracle_module.build_oracle_text_query(["AI/SQL", "vector-search"]) == (
+        "AI ACCUM SQL ACCUM vector ACCUM search"
+    )
+
+
+def test_add_texts_batch_upserts_by_id(oracle_module):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.table_name = "embedding_collection_1"
+    vector.input_type_handler = MagicMock()
+    vector.output_type_handler = MagicMock()
+
+    cursor = MagicMock()
+    connection = _connection_with_cursor(cursor)
+    vector._get_connection = MagicMock(return_value=connection)
+    docs = [
+        Document(page_content="fresh text", metadata={"doc_id": "doc-a", "version": 2}),
+    ]
+
+    ids = vector.add_texts(docs, [[0.1, 0.2]])
+
+    assert ids == ["doc-a"]
+    assert cursor.executemany.call_count == 2
+    delete_sql, delete_rows = cursor.executemany.call_args_list[0].args
+    insert_sql, insert_rows = cursor.executemany.call_args_list[1].args
+    assert "DELETE FROM embedding_collection_1 WHERE id = :1" in delete_sql
+    assert delete_rows == [("doc-a",)]
+    assert "INSERT INTO embedding_collection_1 (id, meta, embedding, text)" in insert_sql
+    assert insert_rows[0][0] == "doc-a"
+    assert insert_rows[0][1] == '{"doc_id": "doc-a", "version": 2}'
+    assert insert_rows[0][3] == "fresh text"
+    connection.commit.assert_called_once()
+
+
+def test_metadata_with_primary_key_preserves_existing_metadata_without_mutation(oracle_module):
+    metadata = {"doc_id": "existing-id", "document_id": "parent-doc"}
+
+    doc_id, normalized_metadata = oracle_module.metadata_with_primary_key(metadata)
+
+    assert doc_id == "existing-id"
+    assert normalized_metadata == {"doc_id": "existing-id", "document_id": "parent-doc"}
+    assert normalized_metadata is not metadata
+    assert metadata == {"doc_id": "existing-id", "document_id": "parent-doc"}
+
+
+def test_add_texts_generates_and_persists_doc_ids_for_missing_metadata(oracle_module, monkeypatch: pytest.MonkeyPatch):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.table_name = "embedding_collection_1"
+    vector.input_type_handler = MagicMock()
+    vector.output_type_handler = MagicMock()
+
+    cursor = MagicMock()
+    connection = _connection_with_cursor(cursor)
+    vector._get_connection = MagicMock(return_value=connection)
+    generated_ids = iter(["generated-1", "generated-2"])
+    monkeypatch.setattr(oracle_module.uuid, "uuid4", lambda: next(generated_ids))
+    docs = [
+        SimpleNamespace(page_content="without metadata", metadata=None),
+        Document(page_content="without doc id", metadata={"document_id": "parent-doc"}),
+    ]
+
+    ids = vector.add_texts(docs, [[0.1], [0.2]])
+
+    assert ids == ["generated-1", "generated-2"]
+    _insert_sql, insert_rows = cursor.executemany.call_args_list[1].args
+    assert insert_rows[0][0] == "generated-1"
+    assert insert_rows[0][1] == '{"doc_id": "generated-1"}'
+    assert insert_rows[1][0] == "generated-2"
+    assert insert_rows[1][1] == '{"document_id": "parent-doc", "doc_id": "generated-2"}'
+
+
 def test_add_texts_inserts_and_logs_on_failures(oracle_module, monkeypatch: pytest.MonkeyPatch):
     vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
     vector.table_name = "embedding_collection_1"
@@ -180,23 +452,34 @@ def test_add_texts_inserts_and_logs_on_failures(oracle_module, monkeypatch: pyte
     vector.output_type_handler = MagicMock()
 
     cursor = MagicMock()
-    cursor.execute.side_effect = [None, RuntimeError("insert failed")]
+    cursor.executemany.side_effect = [None, RuntimeError("batch insert failed")]
+    cursor.execute.side_effect = [
+        None,
+        None,
+        None,
+        None,
+        None,
+        RuntimeError("insert failed"),
+        None,
+    ]
     connection = _connection_with_cursor(cursor)
     vector._get_connection = MagicMock(return_value=connection)
 
     monkeypatch.setattr(oracle_module.uuid, "uuid4", lambda: "generated-uuid")
     docs = [
         Document(page_content="a", metadata={"doc_id": "doc-a"}),
-        Document(page_content="b", metadata={"document_id": "doc-b"}),
-        SimpleNamespace(page_content="c", metadata=None),
+        Document(page_content="b", metadata={"doc_id": "doc-b"}),
     ]
 
-    ids = vector.add_texts(docs, [[0.1], [0.2], [0.3]])
+    ids = vector.add_texts(docs, [[0.1], [0.2]])
 
-    assert ids == ["doc-a", "generated-uuid"]
-    assert cursor.execute.call_count == 2
-    assert connection.commit.call_count >= 1
-    connection.close.assert_called()
+    assert ids == ["doc-a"]
+    assert cursor.executemany.call_count == 2
+    executed_sql = [call.args[0] for call in cursor.execute.call_args_list]
+    assert executed_sql.count("SAVEPOINT oracle_vector_row_upsert") == 2
+    assert "ROLLBACK TO SAVEPOINT oracle_vector_row_upsert" in executed_sql
+    connection.rollback.assert_called_once()
+    connection.commit.assert_called_once()
 
 
 def test_text_exists_and_get_by_ids(oracle_module):
@@ -206,14 +489,14 @@ def test_text_exists_and_get_by_ids(oracle_module):
 
     cursor = MagicMock()
     cursor.fetchone.return_value = ("id-1",)
-    cursor.__iter__.return_value = iter([({"doc_id": "1"}, "text-1"), ({"doc_id": "2"}, "text-2")])
+    cursor.__iter__.return_value = iter([('{"doc_id": "1"}', "text-1"), ('{"doc_id": "2"}', "text-2")])
     vector._get_connection = MagicMock(return_value=_connection_with_cursor(cursor))
 
     assert vector.text_exists("id-1") is True
     docs = vector.get_by_ids(["id-1", "id-2"])
     assert len(docs) == 2
     assert docs[0].page_content == "text-1"
-    vector.pool.release.assert_called_once()
+    vector.pool.release.assert_not_called()
     assert vector.get_by_ids([]) == []
 
 
@@ -231,10 +514,31 @@ def test_delete_methods(oracle_module):
     vector.delete_by_metadata_field("document_id", "doc-1")
     vector.delete()
 
+    with pytest.raises(ValueError, match="Invalid Oracle JSON metadata key"):
+        vector.delete_by_metadata_field("document_id')) = 'x' OR '1'='1", "doc-1")
+
     executed_sql = [call.args[0] for call in cursor.execute.call_args_list]
     assert any("DELETE FROM embedding_collection_1 WHERE id IN" in sql for sql in executed_sql)
     assert any("JSON_VALUE(meta" in sql for sql in executed_sql)
     assert any("DROP TABLE IF EXISTS embedding_collection_1" in sql for sql in executed_sql)
+
+
+def test_delete_by_ids_batches_large_id_lists(oracle_module):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.table_name = "embedding_collection_1"
+
+    cursor = MagicMock()
+    vector._get_connection = MagicMock(return_value=_connection_with_cursor(cursor))
+    ids = [f"id-{index}" for index in range(oracle_module.ORACLE_IN_CLAUSE_BATCH_SIZE + 1)]
+
+    vector.delete_by_ids(ids)
+
+    delete_calls = [
+        call for call in cursor.execute.call_args_list if "DELETE FROM embedding_collection_1" in call.args[0]
+    ]
+    assert len(delete_calls) == 2
+    assert len(delete_calls[0].args[1]) == oracle_module.ORACLE_IN_CLAUSE_BATCH_SIZE
+    assert len(delete_calls[1].args[1]) == 1
 
 
 def test_search_by_vector_with_threshold_and_filter(oracle_module):
@@ -244,13 +548,13 @@ def test_search_by_vector_with_threshold_and_filter(oracle_module):
     vector.output_type_handler = MagicMock()
 
     cursor = MagicMock()
-    cursor.__iter__.return_value = iter([({"doc_id": "1"}, "doc-1", 0.1), ({"doc_id": "2"}, "doc-2", 0.8)])
+    cursor.__iter__.return_value = iter([('{"doc_id": "1"}', "doc-1", 0.1), ('{"doc_id": "2"}', "doc-2", 0.8)])
     connection = _connection_with_cursor(cursor)
     vector._get_connection = MagicMock(return_value=connection)
 
     docs = vector.search_by_vector(
         [0.1, 0.2],
-        top_k=0,
+        top_k=4,
         score_threshold=0.5,
         document_ids_filter=["d-1", "d-2"],
     )
@@ -260,6 +564,17 @@ def test_search_by_vector_with_threshold_and_filter(oracle_module):
     sql = cursor.execute.call_args.args[0]
     assert "fetch first 4 rows only" in sql
     assert "JSON_VALUE(meta, '$.document_id') IN (:2, :3)" in sql
+
+
+def test_search_by_vector_rejects_invalid_top_k_before_sql(oracle_module):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.table_name = "embedding_collection_1"
+    vector._get_connection = MagicMock()
+
+    with pytest.raises(ValueError, match="top_k"):
+        vector.search_by_vector([0.1, 0.2], top_k=0)
+
+    vector._get_connection.assert_not_called()
 
 
 def _fake_nltk_module(*, missing_data=False):
@@ -284,40 +599,84 @@ def test_search_by_full_text_chinese_and_english_paths(oracle_module, monkeypatc
     vector.table_name = "embedding_collection_1"
 
     cursor = MagicMock()
-    cursor.__iter__.return_value = iter([({"doc_id": "1"}, "text-1", [0.1, 0.2])])
+    cursor.__iter__.return_value = iter([('{"doc_id": "1"}', "text-1", [0.1, 0.2], 70)])
     vector._get_connection = MagicMock(return_value=_connection_with_cursor(cursor))
 
     monkeypatch.setattr(oracle_module.pseg, "cut", MagicMock(return_value=[("张", "nr"), ("三", "nr"), ("。", "x")]))
     zh_docs = vector.search_by_full_text("张三", top_k=2)
     assert len(zh_docs) == 1
+    assert zh_docs[0].metadata["score"] == pytest.approx(0.7)
     zh_params = cursor.execute.call_args.args[1]
     assert zh_params["kk"] == "张三"
 
     nltk, nltk_corpus = _fake_nltk_module(missing_data=False)
     monkeypatch.setitem(sys.modules, "nltk", nltk)
     monkeypatch.setitem(sys.modules, "nltk.corpus", nltk_corpus)
-    cursor.__iter__.return_value = iter([({"doc_id": "2"}, "text-2", [0.3, 0.4])])
-    en_docs = vector.search_by_full_text("alice and bob", top_k=-1, document_ids_filter=["d-1"])
+    cursor.__iter__.return_value = iter([('{"doc_id": "2"}', "text-2", [0.3, 0.4], 80)])
+    en_docs = vector.search_by_full_text("alice and bob?", top_k=5, document_ids_filter=["d-1"])
     assert len(en_docs) == 1
     en_sql = cursor.execute.call_args.args[0]
     en_params = cursor.execute.call_args.args[1]
     assert "fetch first 5 rows only" in en_sql
+    assert en_params["kk"] == "alice ACCUM bob"
     assert "doc_id_0" in en_params
+
+
+def test_search_by_full_text_rejects_invalid_top_k_before_sql(oracle_module):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.table_name = "embedding_collection_1"
+    vector._get_connection = MagicMock()
+
+    with pytest.raises(ValueError, match="top_k"):
+        vector.search_by_full_text("query", top_k=-1)
+
+    vector._get_connection.assert_not_called()
 
 
 def test_search_by_full_text_empty_query_and_missing_nltk(oracle_module, monkeypatch: pytest.MonkeyPatch):
     vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
     vector.table_name = "embedding_collection_1"
-    vector._get_connection = MagicMock()
+    cursor = MagicMock()
+    cursor.__iter__.return_value = iter([('{"doc_id": "1"}', "text-1", [0.1], 60)])
+    vector._get_connection = MagicMock(return_value=_connection_with_cursor(cursor))
 
     empty_result = vector.search_by_full_text("")
-    assert empty_result[0].page_content == ""
+    assert empty_result == []
 
     nltk, nltk_corpus = _fake_nltk_module(missing_data=True)
     monkeypatch.setitem(sys.modules, "nltk", nltk)
     monkeypatch.setitem(sys.modules, "nltk.corpus", nltk_corpus)
-    with pytest.raises(LookupError, match="required NLTK data package"):
-        vector.search_by_full_text("english query")
+    docs = vector.search_by_full_text("english query")
+    assert len(docs) == 1
+    assert cursor.execute.call_args.args[1]["kk"] == "english ACCUM query"
+
+
+def test_search_by_full_text_drops_unsafe_or_reserved_tokens(oracle_module, monkeypatch: pytest.MonkeyPatch):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.table_name = "embedding_collection_1"
+    vector._get_connection = MagicMock()
+
+    nltk, nltk_corpus = _fake_nltk_module(missing_data=False)
+    monkeypatch.setitem(sys.modules, "nltk", nltk)
+    monkeypatch.setitem(sys.modules, "nltk.corpus", nltk_corpus)
+
+    assert vector.search_by_full_text("or accum ???", top_k=2) == []
+    vector._get_connection.assert_not_called()
+
+
+def test_search_by_full_text_returns_empty_on_oracle_text_parser_error(oracle_module, monkeypatch: pytest.MonkeyPatch):
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector.table_name = "embedding_collection_1"
+
+    cursor = MagicMock()
+    cursor.execute.side_effect = RuntimeError("DRG-50901 text query parser syntax error")
+    vector._get_connection = MagicMock(return_value=_connection_with_cursor(cursor))
+
+    nltk, nltk_corpus = _fake_nltk_module(missing_data=False)
+    monkeypatch.setitem(sys.modules, "nltk", nltk)
+    monkeypatch.setitem(sys.modules, "nltk.corpus", nltk_corpus)
+
+    assert vector.search_by_full_text("question?", top_k=2) == []
 
 
 def test_create_collection_cache_and_execute_path(oracle_module, monkeypatch: pytest.MonkeyPatch):
@@ -330,7 +689,7 @@ def test_create_collection_cache_and_execute_path(oracle_module, monkeypatch: py
     vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
     vector._collection_name = "collection_1"
     vector.table_name = "embedding_collection_1"
-
+    vector.text_index_name = "idx_docs_embedding_collection_1"
     cursor = MagicMock()
     vector._get_connection = MagicMock(return_value=_connection_with_cursor(cursor))
 
@@ -342,8 +701,31 @@ def test_create_collection_cache_and_execute_path(oracle_module, monkeypatch: py
     vector._create_collection(2)
     executed_sql = [call.args[0] for call in cursor.execute.call_args_list]
     assert any("CREATE TABLE IF NOT EXISTS embedding_collection_1" in sql for sql in executed_sql)
+    assert any("id varchar2(100) PRIMARY KEY" in sql for sql in executed_sql)
     assert any("CREATE INDEX IF NOT EXISTS idx_docs_embedding_collection_1" in sql for sql in executed_sql)
     oracle_module.redis_client.set.assert_called_once()
+
+
+def test_create_collection_does_not_cache_when_index_creation_fails(oracle_module, monkeypatch: pytest.MonkeyPatch):
+    lock = MagicMock()
+    lock.__enter__.return_value = None
+    lock.__exit__.return_value = None
+    monkeypatch.setattr(oracle_module.redis_client, "lock", MagicMock(return_value=lock))
+    monkeypatch.setattr(oracle_module.redis_client, "get", MagicMock(return_value=None))
+    monkeypatch.setattr(oracle_module.redis_client, "set", MagicMock())
+
+    vector = oracle_module.OracleVector.__new__(oracle_module.OracleVector)
+    vector._collection_name = "collection_1"
+    vector.table_name = "embedding_collection_1"
+    vector.text_index_name = "idx_docs_embedding_collection_1"
+    cursor = MagicMock()
+    cursor.execute.side_effect = [None, RuntimeError("index failed")]
+    vector._get_connection = MagicMock(return_value=_connection_with_cursor(cursor))
+
+    with pytest.raises(RuntimeError, match="index failed"):
+        vector._create_collection(2)
+
+    oracle_module.redis_client.set.assert_not_called()
 
 
 def test_oracle_factory_init_vector_uses_existing_or_generated_collection(
@@ -358,13 +740,17 @@ def test_oracle_factory_init_vector_uses_existing_or_generated_collection(
     dataset_without_index = SimpleNamespace(id="dataset-2", index_struct_dict=None, index_struct=None)
 
     monkeypatch.setattr(oracle_module.Dataset, "gen_collection_name_by_id", lambda _id: "AUTO_COLLECTION")
-    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_USER", "system")
-    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_PASSWORD", "oracle")
-    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_DSN", "oracle:1521/freepdb1")
+    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_USER", "test_user")
+    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_PASSWORD", "test_password")
+    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_DSN", "test-db.example:1521/testpdb")
     monkeypatch.setattr(oracle_module.dify_config, "ORACLE_CONFIG_DIR", None)
     monkeypatch.setattr(oracle_module.dify_config, "ORACLE_WALLET_LOCATION", None)
     monkeypatch.setattr(oracle_module.dify_config, "ORACLE_WALLET_PASSWORD", None)
     monkeypatch.setattr(oracle_module.dify_config, "ORACLE_IS_AUTONOMOUS", False)
+    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_POOL_MIN", 2, raising=False)
+    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_POOL_MAX", 8, raising=False)
+    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_POOL_INCREMENT", 2, raising=False)
+    monkeypatch.setattr(oracle_module.dify_config, "ORACLE_POOL_PING_INTERVAL", 0, raising=False)
 
     with patch.object(oracle_module, "OracleVector", return_value="vector") as vector_cls:
         result_1 = factory.init_vector(dataset_with_index, attributes=[], embeddings=MagicMock())
@@ -373,5 +759,9 @@ def test_oracle_factory_init_vector_uses_existing_or_generated_collection(
     assert result_1 == "vector"
     assert result_2 == "vector"
     assert vector_cls.call_args_list[0].kwargs["collection_name"] == "EXISTING_COLLECTION"
+    assert vector_cls.call_args_list[0].kwargs["config"].pool_min == 2
+    assert vector_cls.call_args_list[0].kwargs["config"].pool_max == 8
+    assert vector_cls.call_args_list[0].kwargs["config"].pool_increment == 2
+    assert vector_cls.call_args_list[0].kwargs["config"].pool_ping_interval == 0
     assert vector_cls.call_args_list[1].kwargs["collection_name"] == "AUTO_COLLECTION"
     assert dataset_without_index.index_struct is not None
