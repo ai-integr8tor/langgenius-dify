@@ -254,6 +254,7 @@ class TestPluginModelRuntime:
             tools=None,
             stop=None,
             stream=False,
+            app_id=None,
         )
 
     def test_invoke_llm_returns_plugin_stream_directly(self) -> None:
@@ -286,6 +287,7 @@ class TestPluginModelRuntime:
             tools=None,
             stop=["END"],
             stream=True,
+            app_id=None,
         )
 
     def test_start_llm_polling_resolves_plugin_fields(self) -> None:
