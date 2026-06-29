@@ -174,9 +174,7 @@ def migrate_dataset_permissions_to_rbac(
         last_dataset_id: str | None = None
         while True:
             stmt = (
-                select(Dataset.id, Dataset.tenant_id, Dataset.permission)
-                .order_by(Dataset.id.asc())
-                .limit(batch_size)
+                select(Dataset.id, Dataset.tenant_id, Dataset.permission).order_by(Dataset.id.asc()).limit(batch_size)
             )
             if tenant_id:
                 stmt = stmt.where(Dataset.tenant_id == tenant_id)
