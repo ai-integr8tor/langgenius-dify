@@ -4,8 +4,10 @@ import click
 from sqlalchemy import select
 
 from core.db.session_factory import session_factory
-from models import TenantAccountJoin, TenantAccountRole
-from services.enterprise.rbac_service import ListOption, RBACService
+from models import Dataset, DatasetPermission, DatasetPermissionEnum, TenantAccountJoin, TenantAccountRole
+from services.enterprise.rbac_service import ListOption, RBACService, ReplaceMemberBindings, ReplaceUserAccessPolicies
+
+_RBAC_DEFAULT_ACCESS_POLICY_ID = "default"
 
 
 def _resolve_builtin_role_id(tenant_id: str, operator_account_id: str, legacy_role: str) -> str:
@@ -110,3 +112,154 @@ def migrate_member_roles_to_rbac(tenant_id: str | None, dry_run: bool) -> None:
         click.echo(click.style("Dry run completed. No RBAC bindings were written.", fg="yellow"))
     else:
         click.echo(click.style(f"RBAC member-role migration completed. Migrated {migrated_count} members.", fg="green"))
+
+
+def _dataset_permission_value(permission: DatasetPermissionEnum | str | None) -> str:
+    if permission is None:
+        return DatasetPermissionEnum.ONLY_ME.value
+    if isinstance(permission, str):
+        return permission
+    return permission.value
+
+
+def _rbac_dataset_scope_for_legacy_permission(permission: DatasetPermissionEnum | str | None) -> str:
+    permission_value = _dataset_permission_value(permission)
+    if permission_value == DatasetPermissionEnum.ALL_TEAM.value:
+        return "all"
+    if permission_value in {DatasetPermissionEnum.ONLY_ME.value, DatasetPermissionEnum.PARTIAL_TEAM.value}:
+        return "specific"
+    raise ValueError(f"Unsupported legacy dataset permission: {permission_value}")
+
+
+@click.command(
+    "rbac-migrate-dataset-permissions",
+    help="Migrate legacy dataset permission scopes and partial members into RBAC dataset access bindings.",
+)
+@click.option("--tenant-id", help="Only migrate datasets in a single workspace.")
+@click.option("--dataset-id", help="Only migrate a single dataset.")
+@click.option(
+    "--operator-account-id",
+    help="Account id used as the RBAC operator. Defaults to omitted inner account id.",
+)
+@click.option("--batch-size", default=500, show_default=True, type=click.IntRange(min=1))
+@click.option("--dry-run", is_flag=True, default=False, help="Preview the migration without writing RBAC bindings.")
+def migrate_dataset_permissions_to_rbac(
+    tenant_id: str | None,
+    dataset_id: str | None,
+    operator_account_id: str | None,
+    batch_size: int,
+    dry_run: bool,
+) -> None:
+    """Backfill RBAC dataset access config from legacy `Dataset.permission`.
+
+    Legacy mapping:
+    - all_team_members -> RBAC dataset whitelist scope "all"
+    - partial_members  -> RBAC dataset whitelist scope "specific" plus each partial member gets the
+      virtual default policy
+    - only_me          -> RBAC dataset whitelist scope "specific" with no member policy bindings
+
+    The command replaces each dataset's RBAC whitelist scope first. RBAC clears
+    existing per-user policy bindings during that replace, then this command
+    recreates the legacy partial-member default bindings. Re-running it is
+    therefore idempotent for a dataset's current legacy configuration.
+    """
+    click.echo(click.style("Starting RBAC dataset permission migration.", fg="green"))
+
+    scanned_count = 0
+    scope_migrated_count = 0
+    user_policy_migrated_count = 0
+    partial_dataset_count = 0
+
+    with session_factory.create_session() as session:
+        last_dataset_id: str | None = None
+        while True:
+            stmt = (
+                select(Dataset.id, Dataset.tenant_id, Dataset.permission).order_by(Dataset.id.asc()).limit(batch_size)
+            )
+            if tenant_id:
+                stmt = stmt.where(Dataset.tenant_id == tenant_id)
+            if dataset_id:
+                stmt = stmt.where(Dataset.id == dataset_id)
+            if last_dataset_id:
+                stmt = stmt.where(Dataset.id > last_dataset_id)
+
+            dataset_rows = list(session.execute(stmt).all())
+            if not dataset_rows:
+                break
+
+            dataset_ids = [str(row.id) for row in dataset_rows]
+            partial_members_by_dataset_id: dict[str, list[str]] = {item: [] for item in dataset_ids}
+            permission_rows = session.execute(
+                select(DatasetPermission.dataset_id, DatasetPermission.account_id).where(
+                    DatasetPermission.dataset_id.in_(dataset_ids)
+                )
+            ).all()
+            for row in permission_rows:
+                partial_members_by_dataset_id[str(row.dataset_id)].append(str(row.account_id))
+
+            for dataset in dataset_rows:
+                workspace_id = str(dataset.tenant_id)
+                current_dataset_id = str(dataset.id)
+                permission_value = _dataset_permission_value(dataset.permission)
+                scope = _rbac_dataset_scope_for_legacy_permission(permission_value)
+                partial_member_ids = sorted(set(partial_members_by_dataset_id[current_dataset_id]))
+                should_bind_partial_members = permission_value == DatasetPermissionEnum.PARTIAL_TEAM.value
+
+                click.echo(
+                    f"tenant={workspace_id} dataset={current_dataset_id} "
+                    f"legacy_permission={permission_value} -> rbac_scope={scope} "
+                    f"partial_members={len(partial_member_ids) if should_bind_partial_members else 0}"
+                )
+
+                scanned_count += 1
+                if not dry_run:
+                    RBACService.DatasetAccess.replace_whitelist(
+                        tenant_id=workspace_id,
+                        account_id=operator_account_id,
+                        dataset_id=current_dataset_id,
+                        payload=ReplaceMemberBindings(scope=scope),
+                    )
+                    scope_migrated_count += 1
+
+                if should_bind_partial_members:
+                    partial_dataset_count += 1
+                    for member_account_id in partial_member_ids:
+                        if dry_run:
+                            continue
+                        RBACService.DatasetAccess.replace_user_access_policies(
+                            tenant_id=workspace_id,
+                            account_id=operator_account_id,
+                            dataset_id=current_dataset_id,
+                            target_account_id=member_account_id,
+                            payload=ReplaceUserAccessPolicies(
+                                access_policy_ids=[_RBAC_DEFAULT_ACCESS_POLICY_ID],
+                            ),
+                        )
+                        user_policy_migrated_count += 1
+
+            last_dataset_id = dataset_ids[-1]
+
+            if dataset_id:
+                break
+
+    if scanned_count == 0:
+        click.echo(click.style("No datasets found for migration.", fg="yellow"))
+        return
+
+    if dry_run:
+        click.echo(
+            click.style(
+                f"Dry run completed. Scanned {scanned_count} datasets; "
+                f"{partial_dataset_count} partial-member datasets would be migrated.",
+                fg="yellow",
+            )
+        )
+    else:
+        click.echo(
+            click.style(
+                "RBAC dataset permission migration completed. "
+                f"Scanned {scanned_count} datasets, migrated {scope_migrated_count} scopes, "
+                f"wrote {user_policy_migrated_count} user default-policy bindings.",
+                fg="green",
+            )
+        )
