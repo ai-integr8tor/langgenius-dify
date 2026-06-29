@@ -2411,6 +2411,7 @@ Create a copy of an existing application
 | Code | Description | Schema |
 | ---- | ----------- | ------ |
 | 201 | App copied successfully | **application/json**: [AppDetailWithSite](#appdetailwithsite)<br> |
+| 202 | App copy requires confirmation | **application/json**: [AppImportResponse](#appimportresponse)<br> |
 | 403 | Insufficient permissions |  |
 
 ### [GET] /apps/{app_id}/export
@@ -12363,7 +12364,7 @@ Default namespace
 | role | string |  | No |
 | site | [AppDetailSiteResponse](#appdetailsiteresponse) |  | No |
 | tags | [ [Tag](#tag) ] |  | No |
-| tracing | [JSONValue](#jsonvalue) |  | No |
+| tracing |  |  | No |
 | updated_at | integer |  | No |
 | updated_by | string |  | No |
 | use_icon_as_answer_icon | boolean |  | No |
@@ -14105,7 +14106,7 @@ Enum class for api provider schema type.
 | name | string |  | Yes |
 | permission_keys | [ string ] |  | No |
 | tags | [ [Tag](#tag) ] |  | No |
-| tracing | [JSONValue](#jsonvalue) |  | No |
+| tracing |  |  | No |
 | updated_at | integer |  | No |
 | updated_by | string |  | No |
 | use_icon_as_answer_icon | boolean |  | No |
@@ -14168,7 +14169,7 @@ Enum class for api provider schema type.
 | permission_keys | [ string ] |  | No |
 | site | [AppDetailSiteResponse](#appdetailsiteresponse) |  | No |
 | tags | [ [Tag](#tag) ] |  | No |
-| tracing | [JSONValue](#jsonvalue) |  | No |
+| tracing |  |  | No |
 | updated_at | integer |  | No |
 | updated_by | string |  | No |
 | use_icon_as_answer_icon | boolean |  | No |
@@ -14214,6 +14215,18 @@ Enum class for api provider schema type.
 | name | string |  | No |
 | yaml_content | string |  | No |
 | yaml_url | string |  | No |
+
+#### AppImportResponse
+
+| Name | Type | Description | Required |
+| ---- | ---- | ----------- | -------- |
+| app_id | string |  | No |
+| app_mode | string |  | No |
+| current_dsl_version | string |  | Yes |
+| error | string |  | No |
+| id | string |  | Yes |
+| imported_dsl_version | string |  | No |
+| status | [ImportStatus](#importstatus) |  | Yes |
 
 #### AppListQuery
 
@@ -14356,7 +14369,7 @@ AppMCPServer Status Enum
 
 | Name | Type | Description | Required |
 | ---- | ---- | ----------- | -------- |
-| enabled | boolean |  | Yes |
+| enabled | boolean |  | No |
 | tracing_provider | string |  | No |
 
 #### AppVariableConfig
@@ -17583,7 +17596,7 @@ Metadata operation data
 | ---- | ---- | ----------- | -------- |
 | created_at | integer |  | No |
 | created_by | string |  | No |
-| model | [JSONValue](#jsonvalue) |  | No |
+| model |  |  | No |
 | pre_prompt | string |  | No |
 | updated_at | integer |  | No |
 | updated_by | string |  | No |
