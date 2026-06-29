@@ -1074,6 +1074,7 @@ class TestAppAnnotationServiceBatchImport:
                 "configs.dify_config",
                 new=SimpleNamespace(ANNOTATION_IMPORT_MAX_RECORDS=5, ANNOTATION_IMPORT_MIN_RECORDS=1),
             ),
+            caplog.at_level(logging.DEBUG, logger="services.annotation_service"),
         ):
             mock_db.session.scalar.return_value = app
             mock_redis.zadd.side_effect = RuntimeError("boom")
